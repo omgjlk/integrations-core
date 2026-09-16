@@ -9,8 +9,9 @@ import asyncio
 import logging
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from ddev.cli.ci.tests.dispatcher_attributes import message_fields
 from ddev.cli.ci.tests.messages import BatchFinished, BatchProgressUpdate, TestBatch, UpdatePRComment
 from ddev.cli.ci.tests.pr_comment import render_run_summary, summary_line
 from ddev.cli.ci.tests.rate_limiting import RateLimiterFactory
@@ -23,7 +24,7 @@ from ddev.event_bus.shutdown import ShutdownKind, ShutdownRequest
 from ddev.monitoring import ComponentMonitor
 from ddev.monitoring.context import MonitorContext
 from ddev.monitoring.runtime import MonitoringRuntime
-from ddev.utils.github_actions import write_step_summary
+from ddev.utils.github_actions import get_workflow_run_url, write_step_summary
 from ddev.utils.rate_limiting import RelaxedRateLimits
 
 if TYPE_CHECKING:
@@ -45,19 +46,19 @@ class DispatcherContext:
     """The run being tested. `build_dispatcher` consumes part of it; the rest describes the run
     for the plan header and for the monitoring run context (see `run_fields`).
 
-    `base_sha` and `checkout_sha` are deliberately separate: a pull request is tested at its
-    immutable merge commit, but its checks belong to the head commit. Outside a pull request the
-    two are the same.
+    `checkout_sha` is the tree tested; `head_sha` is the revision that receives its results.
+    They differ for a pull request and are the same for a branch run.
     """
 
     owner: str
     repo: str
     checkout_sha: str
-    base_sha: str
-    branch: str
+    head_sha: str
+    head_branch: str
     workflow: str
     workflow_ref: str
-    target_branch: str | None = None
+    base_branch: str | None = None
+    base_sha: str | None = None
     pr_number: int | None = None
     tags: tuple[str, ...] = ()
     pytest_args: str = ''
@@ -66,7 +67,7 @@ class DispatcherContext:
     @property
     def concurrency_key(self) -> str:
         """New PR revisions must cancel old batches, so they key on the PR, not the merge SHA."""
-        return f'pr-{self.pr_number}' if self.pr_number is not None else self.base_sha
+        return f'pr-{self.pr_number}' if self.pr_number is not None else self.head_sha
 
 
 @dataclass(frozen=True)
@@ -89,50 +90,6 @@ class DispatcherOutcome:
             and self.progress.done
             and all(batch.status is not Status.FAILURE for batch in self.progress.batches)
         )
-
-
-def tag_fields(tags: tuple[str, ...]) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    for tag in tags:
-        key, _, value = tag.partition(':')
-        if key:
-            fields[key] = value
-    return fields
-
-
-PROTECTED_RUN_FIELDS = frozenset({'repo', 'branch', 'commit', 'context', 'pr_number', 'target-branch'})
-
-
-def run_fields(context: DispatcherContext) -> dict[str, Any]:
-    """Resolved identity wins; non-PR context uses the caller's tag or defaults to master."""
-    fields = tag_fields(context.tags)
-    fields.update(
-        {
-            # The head revision the run reports on. `checkout_sha` is deliberately not used: for a
-            # pull request it is the merge commit, whose results belong to the head revision.
-            'commit': context.base_sha,
-            'branch': context.branch,
-            'pr_number': context.pr_number,
-            'target-branch': context.target_branch,
-            'repo': f'{context.owner}/{context.repo}',
-        }
-    )
-    if context.pr_number is not None:
-        fields['context'] = 'pr'
-    elif 'context' not in fields:
-        fields['context'] = 'master'
-    return fields
-
-
-def message_fields(message: BaseMessage) -> dict[str, Any]:
-    """Run-wide reports must not inherit the identity of the batch that triggered them."""
-    match message:
-        case TestBatch(batch_id=batch_id):
-            return {'batch_id': batch_id}
-        case BatchProgressUpdate(batch_id=batch_id, run_id=run_id) | BatchFinished(batch_id=batch_id, run_id=run_id):
-            return {'batch_id': batch_id, 'run_id': run_id}
-        case _:
-            return {}
 
 
 def message_scope(context: MonitorContext) -> MessageScope:
@@ -289,14 +246,16 @@ def build_dispatcher(
             repo=context.repo,
             workflow_id=context.workflow,
             ref=context.workflow_ref,
-            base_sha=context.base_sha,
+            head_sha=context.head_sha,
             checkout_sha=context.checkout_sha,
             concurrency_key=context.concurrency_key,
             artifacts_base_path=artifacts_path,
-            branch=context.branch,
+            head_branch=context.head_branch,
             is_fork=context.is_fork,
             poll_interval_seconds=config.poll_interval_seconds,
             pytest_args=context.pytest_args,
+            origin_run_url=get_workflow_run_url(),
+            pr_number=context.pr_number,
         ),
         artifact_client=client.with_rate_limit(rate_limiters.artifacts),
         monitor=view('test-runner'),

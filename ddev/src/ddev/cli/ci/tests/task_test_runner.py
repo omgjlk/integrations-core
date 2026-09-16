@@ -74,14 +74,16 @@ class TestRunnerOptions:
     repo: str
     workflow_id: str | int
     ref: str
-    base_sha: str
+    head_sha: str
     checkout_sha: str
     concurrency_key: str
     artifacts_base_path: Path
-    branch: str = ''
+    head_branch: str = ''
     is_fork: bool = False
     poll_interval_seconds: float = 30.0
     pytest_args: str = ''
+    origin_run_url: str | None = None
+    pr_number: int | None = None
 
 
 class TaskTestRunner(AsyncProcessor[TestBatch]):
@@ -333,8 +335,8 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
             "concurrency_key": self._options.concurrency_key,
             # The batch is dispatched at the default branch, so its own context describes master.
             # These two say which commit the results belong to, for CI Visibility and the check run.
-            "head_sha": self._options.base_sha,
-            "branch": self._options.branch,
+            "head_sha": self._options.head_sha,
+            "head_branch": self._options.head_branch,
             # The batch withholds every credential when this is true, so it is sent on every dispatch
             # rather than only when set: an absent input would default the workflow to trusting it.
             "is_fork": str(self._options.is_fork).lower(),
@@ -344,6 +346,10 @@ class TaskTestRunner(AsyncProcessor[TestBatch]):
         # GitHub rejects inputs the workflow does not declare, so unset means absent, not empty.
         if self._options.pytest_args:
             inputs["pytest_args"] = self._options.pytest_args
+        if self._options.origin_run_url:
+            inputs["origin_run_url"] = self._options.origin_run_url
+        if self._options.pr_number is not None:
+            inputs["pr_number"] = str(self._options.pr_number)
         size = sum(len(value) for value in inputs.values())
         if size > WORKFLOW_INPUTS_LIMIT:
             raise JobListTooLargeError(message.batch_id, size)

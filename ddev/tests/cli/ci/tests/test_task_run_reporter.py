@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import replace
 
 import httpx
 import pytest
@@ -23,21 +22,23 @@ from ddev.cli.ci.tests.pr_comment import (
     STOPPED_NOTE,
     STOPPED_WITHOUT_RESULTS_NOTE,
 )
-from ddev.cli.ci.tests.progress import JobAttemptProgress, JobProgress, ProgressError
+from ddev.cli.ci.tests.progress import DispatcherProgress, ProgressError
 from ddev.cli.ci.tests.status import Status
 from ddev.cli.ci.tests.task_run_reporter import RunReporterOptions, TaskRunReporter
 from ddev.event_bus.shutdown import ShutdownKind, ShutdownRequest
 from ddev.utils.github_async import GitHubResponse
 from ddev.utils.github_async.models import IssueComment
-from ddev.utils.github_async.models.workflow import WorkflowJobConclusion
 from ddev.utils.github_errors import GitHubAuthenticationError, GitHubBodyTooLongError
 from ddev.utils.rate_limiting import RateLimitWaitAbandoned
 from tests.cli.ci.tests.helpers import (
     TOTAL_JOBS,
+    attempt,
+    batch_progress,
     comment_page,
     failing_progress,
+    failing_report,
+    job_progress,
     jobs_reported,
-    make_job,
     uniform_progress,
 )
 from tests.helpers.github_async import DEFAULT_COMMENT_ID, FakeAsyncGitHubClient
@@ -662,26 +663,22 @@ def test_the_real_cause_of_an_unrelated_validation_error_reaches_the_log():
 
 
 def _tiered_update(revision: int, *, done: bool = False) -> UpdatePRComment:
-    """A snapshot with failures *and* an unavailable result, so all three tiers differ."""
-    progress = failing_progress(done=done)
-    unavailable = JobProgress(
-        job=make_job("mysql-py3.12-linux", target="mysql", environment="py3.12"),
-        attempts=(
-            JobAttemptProgress(
-                attempt=1,
-                job_id=11,
-                status=Status.SUCCESS,
-                conclusion=WorkflowJobConclusion.SUCCESS,
-                failed_steps=(),
-                job_url=None,
-                reports=(),
-                error=ProgressError.NO_ARTIFACTS,
-            ),
-        ),
-    )
-    batch = progress.batches[0]
-    widened = replace(batch, jobs_progress=(*batch.jobs_progress, unavailable))
-    return UpdatePRComment(id=f"msg-{revision}", revision=revision, progress=replace(progress, batches=(widened,)))
+    """A snapshot where all three tiers render differently, plus an unavailable result.
+
+    The number of failing integrations is what a tier sheds, so there have to be more of them than
+    get a group of their own. Below that the compact tier is byte-identical to the full one and the
+    reporter skips it, which is correct but leaves the ladder with only two rungs to walk.
+    """
+    jobs = [
+        job_progress(
+            attempt(Status.FAILURE, reports=(failing_report(*[f"test_number_{n}" for n in range(40)]),)),
+            target=f"integration-{index:02d}",
+        )
+        for index in range(pr_comment.GROUP_LIMIT + 2)
+    ]
+    jobs.append(job_progress(attempt(error=ProgressError.NO_ARTIFACTS, job_url=None), target="mysql"))
+    progress = DispatcherProgress(batches=(batch_progress("batch-01", *jobs, status=Status.FAILURE),), done=done)
+    return UpdatePRComment(id=f"msg-{revision}", revision=revision, progress=progress)
 
 
 def test_the_ladder_walks_all_three_tiers():
@@ -696,13 +693,14 @@ def test_the_ladder_walks_all_three_tiers():
     assert len(bodies) == 3
     sizes = [len(body.encode("utf-8")) for body in bodies]
     assert sizes[2] < sizes[1] < sizes[0]
-    # Tier 2 sheds the secondary sections; tier 3 sheds the per-test detail but keeps the failures.
-    assert "Unavailable results" in bodies[0]
-    assert "Unavailable results" not in bodies[1]
+    # Tier 2 sheds the disclosures holding the integrations past the limit; tier 3 sheds each group's
+    # targets and test names, but every tier still names the integrations and the batches.
+    assert "Show " in bodies[0]
+    assert "Show " not in bodies[1]
     assert "test_number_0" in bodies[1]
     assert "test_number_0" not in bodies[2]
-    assert "Failures" in bodies[2]
-    assert "<table>" in bodies[2]
+    assert "<code>integration-00</code>" in bodies[2]
+    assert "Batches · " in bodies[2]
 
 
 def test_a_too_long_body_never_escapes_the_reporter():

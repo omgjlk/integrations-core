@@ -268,7 +268,8 @@ def test_progress_reaches_the_comment_before_artifact_collection_finishes(
         owner: str, repo: str, comment_id: int, body: str, **kwargs: Any
     ) -> GitHubResponse[IssueComment]:
         result = await update_comment(owner, repo, comment_id, body, **kwargs)
-        if "📥 collecting artifacts" in body:
+        # The chip the batch strip draws while a batch's results are still being collected.
+        if "📥" in body:
             collecting_reported.set()
         return result
 

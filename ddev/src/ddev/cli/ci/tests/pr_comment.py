@@ -3,6 +3,9 @@
 # Licensed under a 3-clause BSD style license (see LICENSE)
 """Render progress and optional shutdown context as the shared Dispatcher PR report.
 
+The layout is target-first: it answers "did my integration break" before "which batch ran it", so
+failures are grouped into one disclosure per integration rather than one entry per failed job.
+
 The footer adds the commit and workflow URL from the environment.
 """
 
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -31,6 +35,9 @@ if TYPE_CHECKING:
 
     # A tier's section builder: given the snapshot and the bytes left, render the section or nothing.
     type SectionBuilder = Callable[[DispatcherProgress, int], str | None]
+
+    # What qualifies a failed target within its group: the noun ("test" or "step") and the name.
+    type Qualifier = tuple[str, str]
 
 # Hidden first line of every Dispatcher comment. It brands the comment and is how the run reporter finds
 # an existing one to edit, so nothing else may write it.
@@ -72,12 +79,7 @@ SHUTDOWN_REASON_LIMIT = 512
 
 # Said in every report while Dispatcher runs in shadow mode: it does not decide merges yet, so its
 # result must not be mistaken for the merge signal.
-SHADOW_NOTICE = (
-    "> **Dispatcher beta: informational only**\n"
-    ">\n"
-    "> Dispatcher is running alongside existing CI while we validate it. You can ignore this report "
-    "and its statuses. Existing CI remains the merge signal."
-)
+SHADOW_NOTICE = "> **Dispatcher beta: informational only**\n> Existing CI remains the merge signal."
 
 # Blocks are joined by a blank line, so each one costs two bytes beyond its own length. Newlines are
 # one byte in UTF-8, so this is the same number in either unit.
@@ -93,6 +95,10 @@ PROGRESS_ERROR_TEXT = {
     ProgressError.NO_ARTIFACTS: "no artifacts were downloaded for this job",
 }
 
+# Said inside a failing integration's group, where the reader is looking at targets rather than
+# plumbing: an unestablished result is not a pass, and the group must not read as one.
+NO_ARTIFACTS_WARNING = "artifacts could not be downloaded — test results unknown"
+
 # Prepended to the run summary when the pull-request comment could not be written. The run summary is
 # then the only place the result exists, so it says so rather than looking like the intended surface.
 RUN_SUMMARY_COMMENT_FAILED_NOTE = (
@@ -102,13 +108,23 @@ RUN_SUMMARY_COMMENT_FAILED_NOTE = (
 )
 
 # The alert explains that unfinished results keep updating; the footer links to the run.
-ALERT_RUNNING_NOTE = "This comment updates automatically as jobs progress and results are collected."
+ALERT_RUNNING_NOTE = "This comment updates automatically."
 
+# Emoji-only chips: the batch strip is one line, so a batch's state has to fit in one glyph.
 STATUS_CHIP = {
-    Status.SUCCESS: "✅ passed",
-    Status.FAILURE: "❌ failed",
-    Status.SKIPPED: "⏭️ skipped",
+    Status.SUCCESS: "✅",
+    Status.FAILURE: "❌",
+    Status.SKIPPED: "⏭️",
 }
+
+# Integrations given a group of their own before the rest go behind a disclosure, and the size of
+# each of those disclosures. A comment body is static Markdown, so a disclosure reveals content that
+# is already in the body rather than fetching it: every hidden group still costs its own bytes.
+GROUP_LIMIT = 10
+
+# Failed targets listed individually in a group before they collapse onto one line. Past this the
+# bullets are the largest thing in the comment and say the least, since they repeat one qualifier.
+TARGET_PREVIEW = 4
 
 
 def _size(text: str) -> int:
@@ -116,48 +132,63 @@ def _size(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _code(text: str) -> str:
+    """A Markdown code span around arbitrary text, fenced wide enough to survive its own backticks.
+
+    Test ids and workflow step names come from outside. A single-backtick span would end early on the
+    first backtick in one and let the rest of it render as markup, so the fence is always longer than
+    the longest run inside it. HTML in a code span renders as literal text, so nothing else is needed.
+    """
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    # A span may neither open nor close on a backtick; one space of padding is stripped on render.
+    padding = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{padding}{text}{padding}{fence}"
+
+
+def _join_names(names: list[str]) -> str:
+    """Names in prose: `a`, `a and b`, `a, b and c`."""
+    if len(names) <= 1:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def render_comment(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None = None) -> str:
     """First of three tiers, budgeted in bytes against the client's own limit so the two cannot drift.
 
     The message's ``revision`` is deliberately not rendered: internal ordering metadata, already logged.
     """
-    return _render(
-        progress, (partial(_failures, detail=True), _unavailable, _retried), shows_unavailable=True, shutdown=shutdown
-    )
+    return _render(progress, (partial(_failures, detail=True, expand_rest=True),), shutdown=shutdown)
 
 
 def render_compact_comment(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None = None) -> str:
-    """Second tier: the failures keep their detail, the secondary sections go.
+    """Second tier: the first `GROUP_LIMIT` integrations keep their detail, the rest become a pointer.
 
-    Which tests failed is why anyone opens the comment; a retried-job list is one line per retry and can
-    be the largest section in a flaky run.
+    What makes a body too long is the number of failing integrations, so the disclosures holding the
+    integrations past that limit go. The note naming their batches stays, since it is then the only
+    route to them.
     """
-    return _render(progress, (partial(_failures, detail=True),), shows_unavailable=False, shutdown=shutdown)
+    return _render(progress, (partial(_failures, detail=True, expand_rest=False),), shutdown=shutdown)
 
 
 def render_minimal_comment(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None = None) -> str:
-    """Last tier: batches, totals and a line per failed job, without naming the failed tests.
+    """Last tier: batches, totals and a summary line per failing integration, without its targets.
 
-    The per-test lists are the dominant cost — 2.1 kB for a job with 40 failures against ~150 bytes for
-    its summary line — so dropping them is what makes this fit. Only the batch table is unbudgeted, and
-    it would need ~464 batches to exhaust the limit on its own.
+    The per-target and per-test lists are the dominant cost — a group of 12 targets failing 3 tests
+    each runs to ~1.4 kB against ~70 bytes for its summary line — so dropping them is what makes this
+    fit. Only the batch strip is unbudgeted, and it would need ~1,400 batches to exhaust the limit.
     """
-    return _render(progress, (partial(_failures, detail=False),), shows_unavailable=False, shutdown=shutdown)
+    return _render(progress, (partial(_failures, detail=False, expand_rest=False),), shutdown=shutdown)
 
 
 def _render(
     progress: DispatcherProgress,
     sections: tuple[SectionBuilder, ...],
     *,
-    shows_unavailable: bool,
     shutdown: ShutdownRequest | None = None,
 ) -> str:
-    """Assemble a body from the header, whichever *sections* this tier keeps, and the footer.
-
-    ``shows_unavailable`` tells the header whether this tier keeps ``_unavailable``, so the alert can
-    neither point at a section that is not here nor stay silent about results it dropped.
-    """
-    header = _header(progress, shows_unavailable=shows_unavailable, shutdown=shutdown)
+    """Assemble a body from the header, whichever *sections* this tier keeps, and the footer."""
+    header = _header(progress, shutdown=shutdown)
     footer = _footer(progress, shutdown=shutdown)
 
     # The header and footer always survive; the detail sections compete for what is left. Two
@@ -213,14 +244,14 @@ def summary_line(progress: DispatcherProgress, *, shutdown: ShutdownRequest | No
 # ---------------------------------------------------------------------------
 
 
-def _header(progress: DispatcherProgress, *, shows_unavailable: bool, shutdown: ShutdownRequest | None = None) -> str:
-    """Marker, heading, notice, in-progress alert and totals: the part that must never be truncated."""
+def _header(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None = None) -> str:
+    """Marker, heading, notice, alert, totals and the batch strip: never truncated."""
     blocks = [COMMENT_MARKER, _heading(progress, shutdown=shutdown), SHADOW_NOTICE]
-    alert = _alert(progress, shows_unavailable=shows_unavailable, shutdown=shutdown)
+    alert = _alert(progress, shutdown=shutdown)
     if alert is not None:
         blocks.append(alert)
     blocks.append(_totals(progress))
-    blocks.append(_batch_table(progress))
+    blocks.append(_batch_strip(progress))
     return "\n\n".join(blocks)
 
 
@@ -237,33 +268,38 @@ def _heading(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None =
     return "## ✅ Dispatcher tests · passed"
 
 
-def _alert(
-    progress: DispatcherProgress, *, shows_unavailable: bool, shutdown: ShutdownRequest | None = None
-) -> str | None:
+def _alert(progress: DispatcherProgress, *, shutdown: ShutdownRequest | None = None) -> str | None:
     """A native GitHub alert, so an unfinished run cannot be mistaken for a final one at a glance.
 
-    A fallback tier sheds the section that lists unestablished results, so the alert states the count
-    itself rather than pointing below, and carries it alongside a failure too. Without that, a fallback
-    body would read as though every result was established.
+    A terminal failure is counted in integrations, because that is the unit the failures below are
+    grouped into, and only the integrations that really failed are counted: a group holding nothing
+    but unestablished results is rendered as a warning, so counting it here would contradict the
+    body. Those results are carried in the same sentence instead, since they get no section of
+    their own and the body would otherwise read as though every result had been established.
     """
     if shutdown is not None:
         return _shutdown_alert(shutdown)
     if not progress.done:
         phase = "Tests finished; collecting results." if _collecting_results(progress) else "Tests are still running."
-        return f"> [!NOTE]\n> **{phase}** {_outstanding(progress)}\n> {ALERT_RUNNING_NOTE}"
+        return f"> [!NOTE]\n> **{phase}** {_outstanding(progress)} {ALERT_RUNNING_NOTE}"
 
     unavailable = _unavailable_count(progress)
     if _has_failure(progress):
-        alert = "> [!CAUTION]\n> **Dispatcher tests failed.** See the failures below."
-        if unavailable and not shows_unavailable:
-            verb = "are" if unavailable > 1 else "is"
-            return f"{alert}\n> {_unavailable_phrase(unavailable)}, and {verb} not listed in this comment."
-        return alert
+        groups = sum(1 for group in _failure_groups(progress) if group.failed)
+        if not groups:
+            # A batch's workflow failed with no tracked job failing: there is no integration to name.
+            # A job count would read as "0 of N jobs failed", so the body is where to look instead.
+            established = f"{_unavailable_phrase(unavailable)}. " if unavailable else ""
+            return f"> [!CAUTION]\n> **Dispatcher tests failed.** {established}See the failures below."
+        plural = "s" if groups > 1 else ""
+        counts = f"{progress.failed} of {progress.total} jobs failed"
+        if unavailable:
+            counts += f"; {_unavailable_phrase(unavailable)}"
+        return f"> [!CAUTION]\n> **{groups} integration{plural} failed.** {counts}."
 
     if unavailable:
         # Deliberately not a CAUTION: nothing failed, and there is no failures section to send anyone to.
-        alert = f"> [!WARNING]\n> **{_unavailable_phrase(unavailable)}.** Nothing failed, but this is not a clean pass."
-        return f"{alert}\n> See the unavailable results below." if shows_unavailable else alert
+        return f"> [!WARNING]\n> **{_unavailable_phrase(unavailable)}.** Nothing failed, but this is not a clean pass."
     return None
 
 
@@ -298,16 +334,28 @@ def _outstanding(progress: DispatcherProgress) -> str:
 
 
 def _totals(progress: DispatcherProgress) -> str:
-    counts = [f"✅ {progress.passed} passed", f"❌ {progress.failed} failed"]
+    """The bar, and the counts behind it as a paragraph of its own.
+
+    A zero is left out rather than printed: a queued run reads as "855 pending", not as three zeroes
+    with the pending count hidden at the end of them.
+    """
+    counts = []
+    if progress.passed:
+        counts.append(f"✅ {progress.passed} passed")
+    if progress.failed:
+        counts.append(f"❌ {progress.failed} failed")
     if progress.skipped:
         counts.append(f"⏭️ {progress.skipped} skipped")
     pending = progress.total - progress.complete
     if pending:
         counts.append(f"⏳ {pending} pending")
+    # Only worth saying once the run is over; while it runs, a zero failure count is not yet news.
+    if progress.done and not progress.failed:
+        counts.append("nothing failed")
 
-    bar = _progress_bar(progress)
-    # Non-breaking space; markdown would collapse plain ones.
-    return f"{bar}\u00a0 **{progress.complete}/{progress.total} jobs**\n{' · '.join(counts)}"
+    # A non-breaking space, so Markdown does not collapse the gap after the bar.
+    jobs = f"{_progress_bar(progress)}&nbsp; **{progress.complete}/{progress.total} jobs**"
+    return f"{jobs}\n\n{' · '.join(counts)}" if counts else jobs
 
 
 def _progress_bar(progress: DispatcherProgress) -> str:
@@ -348,58 +396,399 @@ def _segment_widths(counts: tuple[int, ...], total: int) -> list[int]:
     return widths
 
 
-def _batch_table(progress: DispatcherProgress) -> str:
-    """Every batch, including the ones that have not started — the reason the snapshot carries them."""
+def _batch_strip(progress: DispatcherProgress) -> str:
+    """Every batch on one line, including the ones that have not started.
+
+    Batch state is secondary to the failures below it, so it gets a line rather than a table: a reader
+    who wants a batch wants its link, and a reader who wants a failure wants it out of the way.
+    """
     if not progress.batches:
         return "_No batches were planned._"
 
-    rows = "\n".join(_batch_row(batch) for batch in progress.batches)
-    return (
-        "### Batches\n\n"
-        "<table>\n"
-        "<thead><tr><th>Batch</th><th>State</th><th>Jobs</th><th>Workflow</th></tr></thead>\n"
-        f"<tbody>\n{rows}\n</tbody>\n"
-        "</table>"
-    )
+    entries = []
+    for batch in progress.batches:
+        done = sum(job.complete for job in batch.jobs_progress)
+        entries.append(f"{_batch_chip(batch)} {_batch_link(batch)} {done}/{len(batch.jobs_progress)}")
+
+    strip = f"Batches · {' · '.join(entries)}"
+    # Said once at the end rather than against each batch: before dispatch it is true of all of them.
+    if any(batch.workflow_url is None for batch in progress.batches):
+        strip += " — *links available after dispatch*"
+    return strip
 
 
-def _batch_row(batch: BatchProgress) -> str:
-    done = sum(job.complete for job in batch.jobs_progress)
-    workflow = (
-        f'<a href="{html.escape(batch.workflow_url, quote=True)}">run {batch.run_id}</a>'
-        if batch.workflow_url
-        else "<em>link available after dispatch</em>"
-    )
-    return (
-        f"<tr><td><code>{html.escape(batch.batch_id)}</code></td>"
-        f"<td>{_batch_chip(batch)}</td>"
-        f"<td>{done}/{len(batch.jobs_progress)}</td>"
-        f"<td>{workflow}</td></tr>"
-    )
+def _batch_link(batch: BatchProgress) -> str:
+    """The batch id, linked to its workflow run once there is one to link to."""
+    if batch.workflow_url is None:
+        return _code(batch.batch_id)
+    return f"[{batch.batch_id}]({batch.workflow_url})"
 
 
 def _batch_chip(batch: BatchProgress) -> str:
-    """The batch's state chip.
+    """The batch's state, in one glyph.
 
     ``status`` is taken verbatim, never re-derived from ``jobs_progress``: it is the workflow's own
     conclusion, so a batch can be failed while every tracked job passed (a setup or upload step).
     Rolling the jobs up here would render that batch as passed and hide a real failure.
     """
-    chip = STATUS_CHIP.get(batch.status) if batch.status is not None else None
     if batch.state is ExecutionState.ARTIFACT_DOWNLOAD:
-        return f"{chip} · 📥 collecting artifacts" if chip else "📥 collecting artifacts"
+        return "📥"
     if batch.state is ExecutionState.FINISHED:
-        return chip if chip is not None else "❔ no status reported"
+        chip = STATUS_CHIP.get(batch.status) if batch.status is not None else None
+        return chip if chip is not None else "❔"
     # A rerun is Dispatcher's own business, so at the batch level it is simply unfinished work. Which
     # jobs were retried is reported per job, where it is actionable.
     if batch.state in (ExecutionState.RUNNING, ExecutionState.RETRYING):
-        return "🔄 in progress"
-    return "⏳ queued"
+        return "🔄"
+    return "⏳"
 
 
 # ---------------------------------------------------------------------------
-# Detail sections, in the order they are given up under budget pressure
+# Failures, grouped by integration
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FailedTarget:
+    """One of an integration's targets that failed or whose result could not be established.
+
+    The batch travels with the job because a group spans batches: an integration's targets are
+    partitioned across them, and the batch is what a reader needs in order to open the right run.
+    """
+
+    job: JobProgress
+    attempt: JobAttemptProgress
+    batch_id: str
+
+
+@dataclass(frozen=True)
+class FailureGroup:
+    """Every failed or unestablished target of one integration."""
+
+    integration: str
+    targets: tuple[FailedTarget, ...]
+
+    @property
+    def failed(self) -> bool:
+        """Whether anything here actually failed, as opposed to never reporting a result.
+
+        A group holds both kinds, so the two must not be conflated: a job can conclude `success`
+        and still carry an error, because its status is the workflow's conclusion while its error
+        says whether the Dispatcher managed to collect its results afterwards. Counting such a
+        target as a failure claims the integration is broken on evidence that never arrived.
+        """
+        return any(target.attempt.status is Status.FAILURE for target in self.targets)
+
+
+def _failure_groups(progress: DispatcherProgress) -> list[FailureGroup]:
+    """One group per integration with something to answer for, worst first.
+
+    An unestablished result joins its integration's group rather than getting a section of its own: it
+    is the same question ("is this integration broken?") with the answer missing, and splitting the
+    two sent a reader to two places to find out about one integration.
+    """
+    grouped: dict[str, list[FailedTarget]] = {}
+    for batch, job in _jobs_with_batches(progress):
+        attempt = job.latest
+        if attempt is None or (attempt.status is not Status.FAILURE and attempt.error is None):
+            continue
+        grouped.setdefault(job.job.target, []).append(FailedTarget(job, attempt, batch.batch_id))
+
+    groups = [FailureGroup(integration, tuple(targets)) for integration, targets in grouped.items()]
+    # Real failures first, then most failed targets, then by name so two runs of the same shape
+    # render the same way. Groups holding only unestablished results sort last: they are not
+    # actionable, so they must never displace a failure from the groups that get shown.
+    groups.sort(key=lambda group: (not group.failed, -len(group.targets), group.integration))
+    return groups
+
+
+def _failures(
+    progress: DispatcherProgress, budget: int, *, detail: bool = True, expand_rest: bool = True
+) -> str | None:
+    """The failing integrations, plus anything that failed outside a tracked job.
+
+    With *detail* off each group keeps its summary line but not its targets. With *expand_rest* off
+    the integrations past `GROUP_LIMIT` keep only the note pointing at the batches that hold them.
+    """
+    groups = _failure_groups(progress)
+    shown = [_group(group, detail=detail) for group in groups[:GROUP_LIMIT]]
+    hidden = groups[GROUP_LIMIT:]
+    pointer = _hidden_groups_note(hidden) if hidden else None
+
+    blocks = shown + _batch_notes(progress)
+    if blocks and (trailer := _more_failures_trailer(progress)) is not None:
+        blocks.append(trailer)
+    if not blocks:
+        return None
+
+    # The pointer is the only thing that accounts for the integrations the alert counted but the
+    # body does not show, so its room comes out of the budget before the groups compete for the
+    # rest. Letting it be truncated away would leave a body that looks complete and is not.
+    reserved = OVERFLOW_RESERVE + (_size(pointer) + SECTION_SEPARATOR if pointer is not None else 0)
+    kept, dropped = _pack(blocks, budget - reserved)
+    groups_kept = min(len(shown), len(kept))
+    if pointer is not None:
+        kept.insert(groups_kept, pointer)
+
+    if dropped:
+        # Not even the groups meant to be shown fit, so there is no budget left to put the rest in.
+        kept.append(_overflow_note(dropped, "failing integration"))
+        return "\n\n".join(kept)
+
+    # The rest go behind one disclosure, and only whole. A body that cannot hold it keeps the
+    # pointer instead: half the integrations the pointer accounts for would be worse than none,
+    # because nothing in the body would say which half was kept.
+    if expand_rest and hidden:
+        disclosure = _show_more(hidden)
+        spent = sum(_size(block) + SECTION_SEPARATOR for block in kept)
+        if _size(disclosure) + SECTION_SEPARATOR <= budget - spent:
+            kept.insert(groups_kept + 1, disclosure)
+
+    return "\n\n".join(kept)
+
+
+def _group(group: FailureGroup, *, detail: bool = True) -> str:
+    """One integration as a collapsed disclosure, or just its summary line when *detail* is off."""
+    plural = "s" if len(group.targets) > 1 else ""
+    summary = (
+        f"{_group_chip(group)} <code>{html.escape(group.integration)}</code> — "
+        f"{len(group.targets)} target{plural}, {_group_detail(group)}"
+    )
+    if not detail:
+        return summary
+
+    # The blank line after `</summary>` is load-bearing: without it GitHub does not parse the Markdown
+    # inside the disclosure, and the targets render as one run-on line of literal text.
+    return f"<details>\n<summary>{summary}</summary>\n\n{_group_body(group)}\n\n</details>"
+
+
+def _show_more(groups: list[FailureGroup]) -> str:
+    """Every integration past `GROUP_LIMIT`, collapsed behind one disclosure.
+
+    Only the full tier expands anything, and it keeps every group's detail, so this is always
+    rendered in full: a tier that sheds detail sheds this disclosure first.
+    """
+    body = "\n\n".join(_group(group) for group in groups)
+    return f"<details>\n<summary>Show {len(groups)} more</summary>\n\n{body}\n\n</details>"
+
+
+def _hidden_groups_note(hidden: list[FailureGroup]) -> str:
+    """Where to look for the integrations that did not get a group of their own.
+
+    Said whether or not the disclosure below it survived the budget, because it is the only thing
+    that accounts for the difference between the count in the alert and the groups here. Worded
+    without claiming they failed: the hidden groups can hold unestablished results as easily as
+    failures, and the batch links are where either kind is answered.
+    """
+    plural = "s" if len(hidden) > 1 else ""
+    verb = "are" if len(hidden) > 1 else "is"
+    return f"{len(hidden)} other integration{plural} {verb} listed in the failed batches links above"
+
+
+def _group_chip(group: FailureGroup) -> str:
+    """A group with a real failure is a failure; one with only missing results is a warning."""
+    return "❌" if group.failed else "⚠️"
+
+
+def _group_detail(group: FailureGroup) -> str:
+    """What is known about why the group failed, in the fewest words that stay true.
+
+    Named tests come first because they are the only detail anyone acts on. Missing artifacts outrank
+    a failed step, since the step that failed was the one collecting them and its name explains
+    nothing about the integration.
+    """
+    if tests := _group_tests(group):
+        return f"{len(tests)} test{'s' if len(tests) > 1 else ''}"
+
+    if errors := [target for target in group.targets if target.attempt.error is not None]:
+        if not group.failed:
+            return f"result{'s' if len(errors) > 1 else ''} not established"
+        if any(target.attempt.error is ProgressError.NO_ARTIFACTS for target in errors):
+            return "⚠️ no artifacts"
+
+    if steps := _group_steps(group):
+        return f"{len(steps)} step{'s' if len(steps) > 1 else ''}"
+    if all(target.attempt.reports is None for target in group.targets):
+        return "details pending"
+    return "no failure detail"
+
+
+def _group_body(group: FailureGroup) -> str:
+    """The group's targets, the tests or steps they share, and anything that could not be established."""
+    compressed = len(group.targets) > TARGET_PREVIEW
+    targets = _compressed_targets(group) if compressed else _target_bullets(group)
+    # A bullet always names its own test or step, and the compressed line names one only when every
+    # target shares it. Where neither happened, even a lone test has to be listed below, or the
+    # summary counts it and nothing in the body ever says what it was.
+    minimum = 1 if compressed and _shared_qualifier(group) is None else 2
+    paragraphs = ["\n".join(targets)]
+    if shared := _shared_tests(group, minimum=minimum):
+        paragraphs.append("\n".join(shared))
+    if shared := _shared_steps(group, minimum=minimum):
+        paragraphs.append("\n".join(shared))
+    if warnings := _group_warnings(group):
+        paragraphs.append("\n".join(warnings))
+    return "\n\n".join(paragraphs)
+
+
+def _target_bullets(group: FailureGroup) -> list[str]:
+    """One bullet per target, each naming its own test or step even when it repeats the one above.
+
+    Repeats are not folded into a back-reference: a reader scanning the bullets for a test name has
+    to be able to read it off the target's own line rather than tracking back up the list to find
+    what the reference pointed at.
+    """
+    bullets = []
+    for target in group.targets:
+        bullet = f"- {_target_link(target)} · {target.batch_id}"
+        if (qualifier := _target_qualifier(target)) is not None:
+            noun, name = qualifier
+            bullet += f" · {noun} {_code(name)}"
+        bullets.append(bullet)
+    return bullets
+
+
+def _compressed_targets(group: FailureGroup) -> list[str]:
+    """Past `TARGET_PREVIEW` targets the bullets say the same thing over and over.
+
+    So the targets become one line of links and what they share becomes the next, which is what turns
+    a 12-target group from twelve near-identical bullets into two lines.
+    """
+    shown = " · ".join(_target_link(target) for target in group.targets[:TARGET_PREVIEW])
+    rest = len(group.targets) - TARGET_PREVIEW
+    lines = [f"{shown} · + {rest} more" if rest > 0 else shown]
+
+    shared = ", ".join(sorted({target.batch_id for target in group.targets}))
+    if (qualifier := _shared_qualifier(group)) is not None:
+        shared += f" · {qualifier[0]} {_code(qualifier[1])}"
+    lines.append(shared)
+    return lines
+
+
+def _target_link(target: FailedTarget) -> str:
+    label = _code(_target_label(target.job))
+    return f"[{label}]({target.attempt.job_url})" if target.attempt.job_url else label
+
+
+def _target_qualifier(target: FailedTarget) -> Qualifier | None:
+    """The one test or step that explains this target, when there is exactly one.
+
+    More than one of either is not a qualifier but a list, and a list belongs to the group rather than
+    to the bullet: repeating three test names against each of twelve targets says nothing new.
+    """
+    if len(failed_tests := target.attempt.failed_tests) == 1:
+        return ("test", failed_tests[0].name)
+    if not failed_tests and len(target.attempt.failed_steps) == 1:
+        return ("step", target.attempt.failed_steps[0])
+    return None
+
+
+def _shared_qualifier(group: FailureGroup) -> Qualifier | None:
+    """The qualifier every target in the group shares, when they share one.
+
+    A group whose targets failed differently has no common cause to name, and one whose targets all
+    carry no qualifier has nothing to name either; both are `None`.
+    """
+    qualifiers = {_target_qualifier(target) for target in group.targets}
+    return next(iter(qualifiers)) if len(qualifiers) == 1 else None
+
+
+def _shared_tests(group: FailureGroup, *, minimum: int = 2) -> list[str]:
+    """The group's failed tests, listed once, when a per-target qualifier cannot carry them.
+
+    *minimum* is how many it takes to be worth listing: two where a qualifier already named a lone
+    test, one where nothing did.
+    """
+    tests = _group_tests(group)
+    if len(tests) < minimum:
+        return []
+
+    per_target = {frozenset(_target_tests(target)) for target in group.targets}
+    plural = "s" if len(tests) > 1 else ""
+    lead = (
+        f"All {len(group.targets)} failed the same {len(tests)} test{plural}:"
+        if len(per_target) == 1
+        else f"{len(tests)} failed test{plural} across {len(group.targets)} targets:"
+    )
+    return [lead, *[f"- {_code(test)}" for test in tests]]
+
+
+def _shared_steps(group: FailureGroup, *, minimum: int = 2) -> list[str]:
+    """The group's failed steps, listed once, when a per-target qualifier cannot carry them.
+
+    A target that failed more than one step gets no qualifier on its bullet, and the compressed form
+    carries none at all, so without this the names the gatherer collects are counted by the summary
+    and then discarded. Only when no test was named: the summary counts tests in that case, and the
+    step that ran a failing test explains nothing the test does not.
+    """
+    if _group_tests(group):
+        return []
+    steps = _group_steps(group)
+    if len(steps) < minimum:
+        return []
+
+    per_target = {frozenset(target.attempt.failed_steps) for target in group.targets}
+    plural = "s" if len(steps) > 1 else ""
+    lead = (
+        f"All {len(group.targets)} failed the same {len(steps)} step{plural}:"
+        if len(per_target) == 1
+        else f"{len(steps)} failed step{plural} across {len(group.targets)} targets:"
+    )
+    return [lead, *[f"- {_code(step)}" for step in steps]]
+
+
+def _group_warnings(group: FailureGroup) -> list[str]:
+    """Why part of this group's result is unknown, said once per distinct reason."""
+    reasons = {target.attempt.error for target in group.targets if target.attempt.error is not None}
+    return [
+        f"⚠️ {NO_ARTIFACTS_WARNING if error is ProgressError.NO_ARTIFACTS else PROGRESS_ERROR_TEXT[error]}"
+        for error in ProgressError
+        if error in reasons
+    ]
+
+
+def _target_tests(target: FailedTarget) -> list[str]:
+    """This target's failed tests as fully qualified ids, in report order."""
+    return [f"{case.classname}::{case.name}" for case in target.attempt.failed_tests]
+
+
+def _group_tests(group: FailureGroup) -> list[str]:
+    """Every distinct failed test across the group, in the order first seen."""
+    return list(dict.fromkeys(test for target in group.targets for test in _target_tests(target)))
+
+
+def _group_steps(group: FailureGroup) -> list[str]:
+    """Every distinct failed step across the group, in the order first seen."""
+    return list(dict.fromkeys(step for target in group.targets for step in target.attempt.failed_steps))
+
+
+def _batch_notes(progress: DispatcherProgress) -> list[str]:
+    """Failures and missing results that belong to a batch rather than to any one integration."""
+    notes = []
+    for batch in progress.batches:
+        # A batch whose workflow failed without any tracked job failing is a real failure with
+        # nothing to group; saying so beats a silent omission.
+        if (
+            batch.status is Status.FAILURE
+            and all(job.complete for job in batch.jobs_progress)
+            and not any(_is_failed(job) for job in batch.jobs_progress)
+        ):
+            notes.append(f"❌ {_code(batch.batch_id)} — the workflow failed with no tracked job failure")
+        if batch.error is not None:
+            notes.append(f"⚠️ {_code(batch.batch_id)} — {PROGRESS_ERROR_TEXT[batch.error]}")
+    return notes
+
+
+def _more_failures_trailer(progress: DispatcherProgress) -> str | None:
+    """Say that the failures above are not the final list while batches are still reporting."""
+    if progress.done:
+        return None
+    unfinished = [batch.batch_id for batch in progress.batches if batch.state is not ExecutionState.FINISHED]
+    if not unfinished:
+        return None
+    batches = _join_names([_code(batch_id) for batch_id in unfinished])
+    verb = "report" if len(unfinished) > 1 else "reports"
+    return f"More failures may appear as {batches} {verb}."
 
 
 def _pack(entries: list[str], budget: int) -> tuple[list[str], int]:
@@ -417,112 +806,6 @@ def _pack(entries: list[str], budget: int) -> tuple[list[str], int]:
 def _overflow_note(dropped: int, noun: str) -> str:
     plural = "s" if dropped > 1 else ""
     return f"_{dropped} more {noun}{plural} not shown — the comment reached its size limit._"
-
-
-def _failures(progress: DispatcherProgress, budget: int, *, detail: bool = True) -> str | None:
-    """The failed jobs. With *detail* off, each keeps its count but not the list of failing tests."""
-    entries = []
-    for job in _jobs(progress):
-        attempt = job.latest
-        if attempt is None or attempt.status is not Status.FAILURE:
-            continue
-        entries.append(_failed_job_entry(job, attempt, detail=detail))
-    # A batch whose workflow failed without any tracked job failing is a real failure with nothing
-    # to list; saying so beats an empty section or a silent omission.
-    entries += [
-        f"<code>{html.escape(batch.batch_id)}</code> — the workflow failed with no tracked job failure"
-        for batch in progress.batches
-        if batch.status is Status.FAILURE
-        and all(job.complete for job in batch.jobs_progress)
-        and not any(_is_failed(job) for job in batch.jobs_progress)
-    ]
-    if not entries:
-        return None
-
-    heading = "### ❌ Failures"
-    wrapper = "\n\n<blockquote><div>\n\n\n\n</div></blockquote>"
-    kept, dropped = _pack(entries, budget - _size(heading) - _size(wrapper) - OVERFLOW_RESERVE)
-    if dropped:
-        kept.append(_overflow_note(dropped, "failed job"))
-
-    body = "\n\n".join(kept)
-    return f"{heading}\n\n<blockquote><div>\n\n{body}\n\n</div></blockquote>"
-
-
-def _failed_job_entry(job: JobProgress, attempt: JobAttemptProgress, *, detail: bool = True) -> str:
-    link = f' &nbsp; <a href="{html.escape(attempt.job_url, quote=True)}">view job</a>' if attempt.job_url else ""
-    entry = f"<code> {html.escape(_job_label(job))} </code>{link}"
-    if attempt.reports is None:
-        entry += "\n<sub>Test details pending artifact collection.</sub>"
-
-    # ``<code>`` rather than a Markdown code span: ``html.escape`` leaves backticks alone, and a
-    # backtick in a test id would close a span early and let the rest render as markup.
-    failed_tests = attempt.failed_tests
-    if failed_tests:
-        items = "\n".join(f"- <code>{html.escape(f'{case.classname}::{case.name}')}</code>" for case in failed_tests)
-        summary = f"{len(failed_tests)} failed test{'s' if len(failed_tests) > 1 else ''}"
-    elif attempt.failed_steps:
-        items = "\n".join(f"- <code>{html.escape(step)}</code>" for step in attempt.failed_steps)
-        summary = f"{len(attempt.failed_steps)} failed step{'s' if len(attempt.failed_steps) > 1 else ''}"
-    else:
-        return (
-            entry
-            if attempt.reports is None
-            else f"{entry}\n<sub>No test-level failure was reported for this job.</sub>"
-        )
-
-    if not detail:
-        # The count without the names: enough to see the shape of the failure and open the job.
-        return f"{entry}\n<sub>{summary}</sub>"
-
-    return f"{entry}\n<details open>\n<summary>{summary}</summary>\n\n{items}\n\n</details>"
-
-
-def _unavailable(progress: DispatcherProgress, budget: int) -> str | None:
-    """Batches and jobs whose result could not be established — never rendered as success."""
-    return _list_section("### ⚠️ Unavailable results", _unavailable_entries(progress), budget, "unavailable result")
-
-
-def _unavailable_entries(progress: DispatcherProgress) -> list[str]:
-    """One bullet per unestablished result.
-
-    The header states how many there are and this renders them, so both read the same list: a count
-    derived separately could disagree with the section printed right below it.
-    """
-    entries = [
-        f"- <code>{html.escape(batch.batch_id)}</code> — {PROGRESS_ERROR_TEXT[batch.error]}"
-        for batch in progress.batches
-        if batch.error is not None
-    ]
-    for job in _jobs(progress):
-        attempt = job.latest
-        if attempt is None or attempt.error is None:
-            continue
-        entries.append(f"- <code>{html.escape(_job_label(job))}</code> — {PROGRESS_ERROR_TEXT[attempt.error]}")
-    return entries
-
-
-def _retried(progress: DispatcherProgress, budget: int) -> str | None:
-    """Planned jobs that ran more than once. Retry count is executions minus one, never an attempt id."""
-    entries = []
-    for job in _jobs(progress):
-        attempt = job.latest
-        if job.retry_count == 0 or attempt is None:
-            continue
-        outcome = STATUS_CHIP[attempt.status] if attempt.status is not None else "🔄 in progress"
-        plural = "retries" if job.retry_count > 1 else "retry"
-        entries.append(f"- <code>{html.escape(_job_label(job))}</code> — {outcome} after {job.retry_count} {plural}")
-    return _list_section("### 🔁 Retried jobs", entries, budget, "retried job")
-
-
-def _list_section(heading: str, entries: list[str], budget: int, noun: str) -> str | None:
-    """A heading over a bullet list, truncated to *budget* with an explicit note when it is cut."""
-    if not entries:
-        return None
-    kept, dropped = _pack(entries, budget - _size(heading) - SECTION_SEPARATOR - OVERFLOW_RESERVE)
-    if dropped:
-        kept.append(_overflow_note(dropped, noun))
-    return f"{heading}\n\n" + "\n".join(kept)
 
 
 # ---------------------------------------------------------------------------
@@ -545,9 +828,7 @@ def _shutdown_reason(request: ShutdownRequest) -> str:
     reason = " ".join(str(request.error).split())
     if len(reason) > SHUTDOWN_REASON_LIMIT:
         reason = reason[: SHUTDOWN_REASON_LIMIT - 3].rstrip() + "..."
-    longest_backticks = max((len(run) for run in re.findall(r"`+", reason)), default=0)
-    delimiter = "`" * (longest_backticks + 1)
-    return f"{delimiter} {reason} {delimiter}"
+    return _code(reason)
 
 
 def _footer(progress: DispatcherProgress | None, *, shutdown: ShutdownRequest | None = None) -> str:
@@ -560,19 +841,23 @@ def _footer(progress: DispatcherProgress | None, *, shutdown: ShutdownRequest | 
     if shutdown is None and (progress is None or not progress.done):
         note = "⏳ Dispatcher running"
         if run_url := get_workflow_run_url():
-            note += f' — <a href="{html.escape(run_url, quote=True)}">GitHub Run</a>'
-        return f"<sub>\n{note}.\n</sub>"
+            note += f" — [GitHub Run]({run_url})"
+        return f"<sub>{note}.</sub>"
 
     note = "Dispatcher finished" if shutdown is None else f"Dispatcher {shutdown.kind.value}"
     if sha := get_commit_sha():
-        note += f" on <code>{html.escape(sha)}</code>"
+        note += f" on {_code(sha)}"
     if run_url := get_workflow_run_url():
-        note += f" — <a href=\"{html.escape(run_url, quote=True)}\">GitHub Run</a>"
-    return f"<sub>\n{note}.\n</sub>"
+        note += f" — [GitHub Run]({run_url})"
+    return f"<sub>{note}.</sub>"
 
 
 def _jobs(progress: DispatcherProgress) -> Iterator[JobProgress]:
     return (job for batch in progress.batches for job in batch.jobs_progress)
+
+
+def _jobs_with_batches(progress: DispatcherProgress) -> Iterator[tuple[BatchProgress, JobProgress]]:
+    return ((batch, job) for batch in progress.batches for job in batch.jobs_progress)
 
 
 def _is_failed(job: JobProgress) -> bool:
@@ -591,10 +876,19 @@ def _has_failure(progress: DispatcherProgress) -> bool:
 
 def _unavailable_count(progress: DispatcherProgress) -> int:
     """How many results could not be established, batch-level and job-level together."""
-    return len(_unavailable_entries(progress))
+    batches = sum(1 for batch in progress.batches if batch.error is not None)
+    jobs = sum(1 for job in _jobs(progress) if job.latest is not None and job.latest.error is not None)
+    return batches + jobs
 
 
-def _job_label(job: JobProgress) -> str:
-    label = f"{job.job.target} / {job.job.environment} / {job.job.platform}"
+def _target_label(job: JobProgress) -> str:
+    """A target within its integration: the integration's own name is the group it sits in.
+
+    A target that defines no environments contributes no segment rather than an empty one, so the
+    label never opens with a stray separator.
+    """
+    parts = [part for part in (job.job.environment, str(job.job.platform)) if part]
     # Only the base package variant separates a replica from its ordinary job.
-    return f"{label} / minimum base package" if job.job.minimum_base_package else label
+    if job.job.minimum_base_package:
+        parts.append("minimum base package")
+    return " / ".join(parts)

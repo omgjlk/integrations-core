@@ -10,7 +10,7 @@ from datadog_checks.dev import docker_run, run_command
 from datadog_checks.dev.conditions import CheckDockerLogs
 from datadog_checks.dev.kind import kind_run
 
-from .common import HERE, LINKERD_FIXTURE_METRICS, LINKERD_FIXTURE_TYPES
+from .common import HERE
 
 
 def setup_linkerd_cluster():
@@ -37,9 +37,7 @@ def dd_environment():
             attempts=2,
         ):
             instance = {
-                'prometheus_url': 'http://linkerd-controller-proxy-metrics.linkerd.svc.cluster.local:4191/metrics',
-                'metrics': [LINKERD_FIXTURE_METRICS],
-                'type_overrides': LINKERD_FIXTURE_TYPES,
+                'openmetrics_endpoint': 'http://linkerd-proxy-metrics.emojivoto.svc.cluster.local:4191/metrics',
             }
             metadata = {
                 'agent_type': 'kubernetes',

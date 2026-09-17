@@ -595,3 +595,38 @@ for metric_name, metric_type in list(EXPECTED_METRICS_V2.items()):
             EXPECTED_METRICS_V2_NEW['{}.bucket'.format(metric_prefix)] = aggregator.MONOTONIC_COUNT
     else:
         EXPECTED_METRICS_V2_NEW[metric_name] = metric_type
+
+
+EXPECTED_METRICS_V2_NEW_E2E = {
+    'linkerd.control.request.count': aggregator.COUNT,
+    'linkerd.control.response.count': aggregator.COUNT,
+    'linkerd.control.response_latency.bucket': aggregator.COUNT,
+    'linkerd.control.response_latency.count': aggregator.COUNT,
+    'linkerd.control.response_latency.sum': aggregator.COUNT,
+    'linkerd.openmetrics.health': aggregator.GAUGE,
+    'linkerd.process.max_fds': aggregator.GAUGE,
+    'linkerd.process.open_fds': aggregator.GAUGE,
+    'linkerd.process.resident_memory': aggregator.GAUGE,
+    'linkerd.process.start_time': aggregator.GAUGE,
+    'linkerd.process.virtual_memory': aggregator.GAUGE,
+    'linkerd.request.count': aggregator.COUNT,
+    'linkerd.response.count': aggregator.COUNT,
+    'linkerd.response_latency.bucket': aggregator.COUNT,
+    'linkerd.response_latency.count': aggregator.COUNT,
+    'linkerd.response_latency.sum': aggregator.COUNT,
+    'linkerd.tcp.close.count': aggregator.COUNT,
+    'linkerd.tcp.open.count': aggregator.COUNT,
+    'linkerd.tcp.open_connections': aggregator.GAUGE,
+    'linkerd.tcp.read_bytes.count': aggregator.COUNT,
+    'linkerd.tcp.write_bytes.count': aggregator.COUNT,
+}
+
+OPTIONAL_METRICS_V2_NEW_E2E = {
+    'linkerd.process.cpu_seconds.count': aggregator.COUNT,
+    'linkerd.route.actual_request.count': aggregator.COUNT,
+    'linkerd.route.request.count': aggregator.COUNT,
+    'linkerd.route.response.count': aggregator.COUNT,
+    'linkerd.route.response_latency.bucket': aggregator.COUNT,
+    'linkerd.route.response_latency.count': aggregator.COUNT,
+    'linkerd.route.response_latency.sum': aggregator.COUNT,
+}

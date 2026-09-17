@@ -8,5 +8,5 @@ services:
 
 networks:
   default:
-    external:
-      name: kind
+    name: kind
+    external: true

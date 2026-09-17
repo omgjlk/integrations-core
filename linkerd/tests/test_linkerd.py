@@ -10,13 +10,13 @@ from datadog_checks.linkerd import LinkerdCheck
 
 from .common import (
     EXPECTED_METRICS_V2,
-    EXPECTED_METRICS_V2_E2E,
     EXPECTED_METRICS_V2_NEW,
+    EXPECTED_METRICS_V2_NEW_E2E,
     HERE,
     LINKERD_FIXTURE_VALUES,
     MOCK_INSTANCE,
     MOCK_INSTANCE_NEW,
-    OPTIONAL_METRICS_V2_E2E,
+    OPTIONAL_METRICS_V2_NEW_E2E,
 )
 
 
@@ -94,11 +94,10 @@ def test_openmetrics_error(monkeypatch, dd_run_check):
 @pytest.mark.e2e
 def test_e2e(dd_agent_check):
     aggregator = dd_agent_check(rate=True)
-    for metric_name, metric_type in EXPECTED_METRICS_V2_E2E.items():
-        if metric_name in OPTIONAL_METRICS_V2_E2E:
-            aggregator.assert_metric(metric_name, metric_type=metric_type, at_least=0)
-        else:
-            aggregator.assert_metric(metric_name, metric_type=metric_type)
+    for metric_name, metric_type in EXPECTED_METRICS_V2_NEW_E2E.items():
+        aggregator.assert_metric(metric_name, metric_type=metric_type)
+    for metric_name, metric_type in OPTIONAL_METRICS_V2_NEW_E2E.items():
+        aggregator.assert_metric(metric_name, metric_type=metric_type, at_least=0)
     aggregator.assert_all_metrics_covered()
 
-    aggregator.assert_service_check('linkerd.prometheus.health', status=LinkerdCheck.OK, count=2)
+    aggregator.assert_service_check('linkerd.openmetrics.health', status=LinkerdCheck.OK, count=2)
